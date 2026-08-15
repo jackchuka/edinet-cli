@@ -1,0 +1,39 @@
+version: 2
+
+# The repo is edinet-cli but the command is `edinet`. Pinning project_name keeps
+# release artifacts and any future Homebrew formula named after the binary
+# people actually type, rather than after the repository.
+project_name: edinet
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: edinet
+    main: ./cmd/edinet
+    binary: edinet
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X github.com/jackchuka/edinet-cli/internal/version.Version={{.Version}}
+      - -X github.com/jackchuka/edinet-cli/internal/version.Commit={{.Commit}}
+      - -X github.com/jackchuka/edinet-cli/internal/version.BuildDate={{.Date}}
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+      - "^style:"
+      - "^refactor:"

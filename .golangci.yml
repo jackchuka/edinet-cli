@@ -1,0 +1,19 @@
+version: "2"
+linters:
+  default: standard
+  settings:
+    errcheck:
+      # Writes to stdout/stderr and deferred Close on readers have no
+      # meaningful recovery path; checking them adds noise, not safety.
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (*os.File).Close
+
+formatters:
+  enable:
+    - goimports
+    - gofmt

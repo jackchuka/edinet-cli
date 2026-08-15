@@ -1,0 +1,5 @@
+/edinet
+/dist/
+*.zip
+*.pdf
+.DS_Store
