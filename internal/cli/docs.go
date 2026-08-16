@@ -166,27 +166,26 @@ func runDocsList(ctx context.Context, g *globals, opts *listOptions, w io.Writer
 		return nil
 	}
 
-	return output.Render(w, format, docsTable(filtered), filtered)
+	return output.Render(w, format, docsSpec(), filtered)
 }
 
-func docsTable(docs []edinet.Document) output.Table {
-	t := output.Table{
+func docsSpec() output.TableSpec[edinet.Document] {
+	return output.TableSpec[edinet.Document]{
 		Headers: []string{"DOCID", "SUBMITTED", "EDINET", "TICKER", "FILER", "TYPE", "DESCRIPTION", "FILES"},
 		Max:     []int{0, 0, 0, 0, 24, 0, 40, 0},
+		Row: func(d edinet.Document) []string {
+			return []string{
+				d.DocID,
+				d.SubmitDateTime,
+				d.EdinetCode,
+				ticker(d.SecCode),
+				d.FilerName,
+				codes.DocTypeName(d.DocTypeCode),
+				d.DocDescription,
+				availableFiles(d),
+			}
+		},
 	}
-	for _, d := range docs {
-		t.Rows = append(t.Rows, []string{
-			d.DocID,
-			d.SubmitDateTime,
-			d.EdinetCode,
-			ticker(d.SecCode),
-			d.FilerName,
-			codes.DocTypeName(d.DocTypeCode),
-			d.DocDescription,
-			availableFiles(d),
-		})
-	}
-	return t
 }
 
 func availableFiles(d edinet.Document) string {

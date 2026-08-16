@@ -113,23 +113,45 @@ edinet docs get S100XXXX --file pdf --stdout > report.pdf
 
 ### Extract financial facts
 
-`edinet facts` downloads a filing's CSV bundle, decodes it, and turns it into rows you can filter.
+`edinet facts` downloads filings' CSV bundles, decodes them, and turns them into
+rows you can filter. Every row in the `json` and `csv` output carries the filing
+it came from — document ID, EDINET code, securities code, fiscal period,
+accounting standard — so results can be joined against other data without a
+second lookup.
+
+Only filings whose `csv` flag is set have a bundle — find them with
+`edinet docs list --has csv`.
 
 ```bash
-# Revenue lines
+# Revenue lines from one annual report
 edinet facts S100XXXX --grep 売上高
 
-# Consolidated figures for the current period, no narrative text
-edinet facts S100XXXX --consolidated --period 当期 --numeric
+# Several filings at once
+edinet facts S100XXXX S100YYYY --element NetSales -o csv
 
-# A specific XBRL element
-edinet facts S100XXXX --element NetSales -o csv
+# A whole month of annual reports, piped in
+edinet docs list --from 2026-06-01 --to 2026-06-30 --type yuho --has csv -o json \
+  | jq -r '.[].docID' \
+  | edinet facts - --element NetSales --consolidated -o csv
 
-# Re-read a bundle you already downloaded
-edinet facts --file ./S100XXXX_csv.zip -o json
+# Bundles already on disk
+edinet facts --file ./downloads/*_csv.zip -o json
 ```
 
-Only filings with a `csv` flag have a bundle — find them with `edinet docs list --has csv`.
+Downloads run `--concurrency` at a time and output keeps the input order. A
+filing that cannot be read is reported on stderr and skipped; the rest still
+come through, and the exit code is non-zero so a script can tell. Empty input
+on `-` (no document IDs on stdin) is not an error — it produces empty output,
+so a quiet week in an upstream `docs list` doesn't break the pipeline.
+
+Once `--file` is given, any positional arguments are read as further bundle
+paths rather than document IDs — that's what makes `--file ./dl/*.zip` work,
+with the shell expanding the glob. The `docId` column is recovered from the
+filename `docs get` writes (`<docID>_csv.zip`); a renamed bundle yields an
+empty `docId` rather than a guess.
+
+The `table` format buffers every row to align its columns, so use `-o csv` or
+`-o json` for large batches.
 
 | Flag | Description |
 | --- | --- |
@@ -138,7 +160,7 @@ Only filings with a `csv` flag have a bundle — find them with `edinet docs lis
 | `--consolidated` / `--standalone` | Keep 連結 or 個別 figures |
 | `--period` | Match the relative period, e.g. `当期` |
 | `--numeric` | Drop narrative text blocks |
-| `--file` | Read a local bundle instead of downloading |
+| `--file` | Read a downloaded bundle instead (repeatable) |
 
 ### Look up companies
 
@@ -156,6 +178,45 @@ edinet codes           # document type and ordinance codes, plus --type aliases
 ```
 
 Aliases include `yuho` (有価証券報告書), `hanki` (半期報告書), `rinji` (臨時報告書), `taryo` (大量保有報告書), `naibu` (内部統制報告書), and `tob` (公開買付届出書).
+
+`-o json` and `-o csv` emit the three tables as one flat set of records with
+`table`, `key`, and `value` fields, e.g. `edinet codes -o json | jq '.[] | select(.table == "alias")'`.
+
+## Using with J-Quants
+
+[J-Quants](https://jpx-jquants.com/) serves prices and normalised financial
+summaries for listed Japanese companies. It pairs well with EDINET, because the
+two cover different ground:
+
+- **Item-level financial statements** (`/fins/details`) are on the Premium plan
+  only. The same figures are in every annual report's XBRL, which `edinet facts`
+  reads for free.
+- **The Free plan delays everything by 12 weeks.** EDINET serves filings the day
+  they are submitted.
+- **Narrative sections, 臨時報告書, TOB filings, and internal control reports**
+  are not in J-Quants at any tier.
+- **決算短信 comes from TDnet, not EDINET.** For headline earnings ahead of the
+  annual report, J-Quants `/fins/summary` is the right source.
+
+Joining the two needs no translation:
+
+- `secCode` is EDINET's 5-digit code with its trailing zero (Toyota is `72030`),
+  which is the same form J-Quants uses for `Code`. The `json` and `csv` output
+  keeps it unmodified; only the table display trims it to 4 digits.
+- `fiscalYearEnd` and `periodEnd` line up with the fiscal year end and current
+  period end J-Quants reports. They differ in a semiannual report, which is why
+  both are given.
+- `accountingStandard` tells you whether an element ID follows Japan GAAP, IFRS,
+  or US GAAP. This tool keeps no mapping between them on purpose — the element
+  IDs are reported as filed.
+
+```bash
+# Every annual report filed in June, one row per reported revenue figure
+edinet docs list --from 2026-06-01 --to 2026-06-30 --type yuho --has csv -o json \
+  | jq -r '.[].docID' \
+  | edinet facts - --element NetSales --consolidated --period 当期 -o csv \
+  > netsales.csv
+```
 
 ## How it works
 

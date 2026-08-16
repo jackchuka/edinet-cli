@@ -159,3 +159,158 @@ func TestIsNumeric(t *testing.T) {
 		}
 	}
 }
+
+// buildBundleWithDEI mirrors what EDINET actually ships: the filing's own CSV
+// carries a jpdei_cor block identifying the document, and the audit report
+// carries its own. Map iteration order is randomized here, but ParseZip
+// deterministically normalizes the order before parsing, so this test depends
+// on that normalization, not on physical ZIP entry order.
+func buildBundleWithDEI(t *testing.T, dei string) []byte {
+	t.Helper()
+
+	main := header + dei +
+		"jpcrp_cor:NetSales\t売上高\tCurrentYearDuration\t当期\t連結\t期間\tJPY\t円\t45095325000000\n"
+
+	audit := header +
+		"jpdei_cor:EDINETCodeDEI\tEDINETコード\tFilingDateInstant\t当期\t\t時点\t\t\tE99999\n" +
+		"jpaud_cor:OpinionHeading\t監査意見\tCurrentYearDuration\t当期\t連結\t期間\t\t\t無限定適正意見\n"
+
+	var buf bytes.Buffer
+	zw := zip.NewWriter(&buf)
+	for name, content := range map[string]string{
+		"XBRL_TO_CSV/jpaud_202603-asr-001_E02144-000_2026-03-31_01_2026-06-20.csv": audit,
+		"XBRL_TO_CSV/jpcrp030000-asr-001_E02144-000_2026-03-31_01_2026-06-20.csv":  main,
+	} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatalf("creating zip entry: %v", err)
+		}
+		if _, err := w.Write(encodeUTF16LE(t, content)); err != nil {
+			t.Fatalf("writing zip entry: %v", err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("closing zip: %v", err)
+	}
+	return buf.Bytes()
+}
+
+func deiRow(element, value string) string {
+	return element + "\t項目\tFilingDateInstant\t当期\t\t時点\t\t\t" + value + "\n"
+}
+
+func TestDEI(t *testing.T) {
+	listed := deiRow("jpdei_cor:EDINETCodeDEI", "E02144") +
+		deiRow("jpdei_cor:SecurityCodeDEI", "72030") +
+		deiRow("jpdei_cor:FilerNameInJapaneseDEI", "トヨタ自動車株式会社") +
+		deiRow("jpdei_cor:CurrentFiscalYearStartDateDEI", "2025-04-01") +
+		deiRow("jpdei_cor:CurrentFiscalYearEndDateDEI", "2026-03-31") +
+		deiRow("jpdei_cor:DocumentTypeDEI", "有価証券報告書") +
+		deiRow("jpdei_cor:AccountingStandardsDEI", "IFRS")
+
+	// A半期報告書 reports a period end that is not the fiscal year end. Folding
+	// them into one field would make the two indistinguishable.
+	semi := listed + deiRow("jpdei_cor:CurrentPeriodEndDateDEI", "2025-09-30")
+
+	// Investment corporations and unlisted filers have no securities code.
+	unlisted := deiRow("jpdei_cor:EDINETCodeDEI", "E12345") +
+		deiRow("jpdei_cor:FilerNameInJapaneseDEI", "非上場株式会社") +
+		deiRow("jpdei_cor:CurrentFiscalYearEndDateDEI", "2026-03-31")
+
+	tests := []struct {
+		name string
+		dei  string
+		want Filing
+	}{
+		{
+			name: "annual report",
+			dei:  listed,
+			want: Filing{
+				EdinetCode:         "E02144",
+				SecCode:            "72030",
+				FilerName:          "トヨタ自動車株式会社",
+				FiscalYearStart:    "2025-04-01",
+				FiscalYearEnd:      "2026-03-31",
+				PeriodEnd:          "2026-03-31",
+				DocumentType:       "有価証券報告書",
+				AccountingStandard: "IFRS",
+			},
+		},
+		{
+			name: "semiannual report keeps period end distinct",
+			dei:  semi,
+			want: Filing{
+				EdinetCode:         "E02144",
+				SecCode:            "72030",
+				FilerName:          "トヨタ自動車株式会社",
+				FiscalYearStart:    "2025-04-01",
+				FiscalYearEnd:      "2026-03-31",
+				PeriodEnd:          "2025-09-30",
+				DocumentType:       "有価証券報告書",
+				AccountingStandard: "IFRS",
+			},
+		},
+		{
+			name: "unlisted filer has no securities code",
+			dei:  unlisted,
+			want: Filing{
+				EdinetCode:    "E12345",
+				FilerName:     "非上場株式会社",
+				FiscalYearEnd: "2026-03-31",
+				PeriodEnd:     "2026-03-31",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			all, err := ParseZip(buildBundleWithDEI(t, tt.dei))
+			if err != nil {
+				t.Fatalf("ParseZip: %v", err)
+			}
+			got := DEI(all)
+			if got != tt.want {
+				t.Errorf("DEI() = %+v\nwant %+v", got, tt.want)
+			}
+		})
+	}
+}
+
+// The audit report carries its own DEI block describing the auditor's document.
+// Taking values from it would mislabel the filing.
+func TestDEIIgnoresAuditReport(t *testing.T) {
+	dei := deiRow("jpdei_cor:EDINETCodeDEI", "E02144")
+	all, err := ParseZip(buildBundleWithDEI(t, dei))
+	if err != nil {
+		t.Fatalf("ParseZip: %v", err)
+	}
+	if got := DEI(all).EdinetCode; got != "E02144" {
+		t.Errorf("edinetCode = %q, want E02144 (E99999 comes from the audit report)", got)
+	}
+}
+
+// TestDEIIgnoresAuditReportDirect calls DEI directly with audit facts placed
+// before filing facts, bypassing ParseZip's sort. This test will fail if the
+// isAudit(fact.Source) check in DEI is removed, verifying that the audit-skip
+// rule is actually being enforced (not just happening to work due to sort order).
+func TestDEIIgnoresAuditReportDirect(t *testing.T) {
+	all := []Fact{
+		// Audit fact comes first, with conflicting EDINET code
+		{
+			ElementID: "jpdei_cor:EDINETCodeDEI",
+			Value:     "E99999",
+			Source:    "jpaud_202603-asr-001_E02144-000_2026-03-31_01_2026-06-20.csv",
+		},
+		// Filing fact comes second, with correct EDINET code
+		{
+			ElementID: "jpdei_cor:EDINETCodeDEI",
+			Value:     "E02144",
+			Source:    "jpcrp030000-asr-001_E02144-000_2026-03-31_01_2026-06-20.csv",
+		},
+	}
+
+	got := DEI(all)
+	if got.EdinetCode != "E02144" {
+		t.Errorf("EdinetCode = %q, want E02144 (audit fact with E99999 should be skipped)", got.EdinetCode)
+	}
+}
