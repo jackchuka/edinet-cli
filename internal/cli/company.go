@@ -60,7 +60,7 @@ func newCompanySearchCommand() *cobra.Command {
 				return nil
 			}
 
-			return output.Render(cmd.OutOrStdout(), f, companyTable(matches), matches)
+			return output.Render(cmd.OutOrStdout(), f, companySpec(), matches)
 		},
 	}
 
@@ -69,22 +69,14 @@ func newCompanySearchCommand() *cobra.Command {
 	return cmd
 }
 
-func companyTable(entries []codelist.Entry) output.Table {
-	t := output.Table{
+func companySpec() output.TableSpec[codelist.Entry] {
+	return output.TableSpec[codelist.Entry]{
 		Headers: []string{"EDINET", "TICKER", "NAME", "INDUSTRY", "LISTED", "FYE"},
 		Max:     []int{0, 0, 36, 16, 0, 0},
+		Row: func(e codelist.Entry) []string {
+			return []string{e.EdinetCode, e.Ticker(), e.Name, e.Industry, e.Listed, e.FiscalYearEnd}
+		},
 	}
-	for _, e := range entries {
-		t.Rows = append(t.Rows, []string{
-			e.EdinetCode,
-			e.Ticker(),
-			e.Name,
-			e.Industry,
-			e.Listed,
-			e.FiscalYearEnd,
-		})
-	}
-	return t
 }
 
 func newCompanySyncCommand() *cobra.Command {

@@ -19,7 +19,7 @@ func newCodesCommand() *cobra.Command {
 Document types can be given to --type either by code (120) or by the alias
 listed here (yuho).`,
 		Example: `  edinet codes
-  edinet codes -o json | jq '.docTypes'`,
+  edinet codes -o json | jq '.[] | select(.table == "alias")'`,
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			f, err := output.ParseFormat(format)
@@ -29,25 +29,21 @@ listed here (yuho).`,
 			w := cmd.OutOrStdout()
 
 			if f != output.FormatTable {
-				return output.Render(w, f, codeTable(), map[string]any{
-					"docTypes":   codes.DocTypes,
-					"ordinances": codes.Ordinances,
-					"aliases":    aliasMap(),
-				})
+				return output.Render(w, f, codeSpec(), codeEntries())
 			}
 
 			fmt.Fprintln(w, "Document types (--type)")
-			if err := output.Render(w, f, pairTable("CODE", "NAME", codes.SortedDocTypes()), nil); err != nil {
+			if err := output.Render(w, f, pairSpec("CODE", "NAME"), codes.SortedDocTypes()); err != nil {
 				return err
 			}
 
 			fmt.Fprintln(w, "\nAliases")
-			if err := output.Render(w, f, pairTable("ALIAS", "CODE", codes.Aliases()), nil); err != nil {
+			if err := output.Render(w, f, pairSpec("ALIAS", "CODE"), codes.Aliases()); err != nil {
 				return err
 			}
 
 			fmt.Fprintln(w, "\nOrdinances (ordinanceCode)")
-			return output.Render(w, f, pairTable("CODE", "NAME", codes.SortedOrdinances()), nil)
+			return output.Render(w, f, pairSpec("CODE", "NAME"), codes.SortedOrdinances())
 		},
 	}
 
@@ -55,34 +51,41 @@ listed here (yuho).`,
 	return cmd
 }
 
-func pairTable(h1, h2 string, pairs [][2]string) output.Table {
-	t := output.Table{Headers: []string{h1, h2}}
-	for _, p := range pairs {
-		t.Rows = append(t.Rows, []string{p[0], p[1]})
-	}
-	return t
+// CodeEntry is one row of the reference tables. The three tables share a shape
+// so that -o json and -o csv describe the same records; the table format still
+// prints them as three labelled sections.
+type CodeEntry struct {
+	Table string `json:"table"`
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
-// codeTable is the flat view used for CSV output, where the three tables have
-// to share one shape.
-func codeTable() output.Table {
-	t := output.Table{Headers: []string{"TABLE", "KEY", "VALUE"}}
+func codeEntries() []CodeEntry {
+	var out []CodeEntry
 	for _, p := range codes.SortedDocTypes() {
-		t.Rows = append(t.Rows, []string{"docType", p[0], p[1]})
+		out = append(out, CodeEntry{"docType", p[0], p[1]})
 	}
 	for _, p := range codes.Aliases() {
-		t.Rows = append(t.Rows, []string{"alias", p[0], p[1]})
+		out = append(out, CodeEntry{"alias", p[0], p[1]})
 	}
 	for _, p := range codes.SortedOrdinances() {
-		t.Rows = append(t.Rows, []string{"ordinance", p[0], p[1]})
+		out = append(out, CodeEntry{"ordinance", p[0], p[1]})
 	}
-	return t
+	return out
 }
 
-func aliasMap() map[string]string {
-	m := map[string]string{}
-	for _, p := range codes.Aliases() {
-		m[p[0]] = p[1]
+func codeSpec() output.TableSpec[CodeEntry] {
+	return output.TableSpec[CodeEntry]{
+		Headers: []string{"TABLE", "KEY", "VALUE"},
+		Row:     func(e CodeEntry) []string { return []string{e.Table, e.Key, e.Value} },
 	}
-	return m
+}
+
+// pairSpec renders a two-column reference table. Only the table format uses it,
+// so no json tags are needed on [2]string.
+func pairSpec(h1, h2 string) output.TableSpec[[2]string] {
+	return output.TableSpec[[2]string]{
+		Headers: []string{h1, h2},
+		Row:     func(p [2]string) []string { return []string{p[0], p[1]} },
+	}
 }

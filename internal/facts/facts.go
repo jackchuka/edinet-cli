@@ -36,6 +36,86 @@ type Fact struct {
 	Source string `json:"source"`
 }
 
+// Filing identifies the document a fact came from.
+//
+// Every value comes from the bundle's own jpdei_cor block, so labelling a row
+// costs no extra request. SecCode is EDINET's 5-digit securities code with its
+// trailing zero, left unmodified because that is the form J-Quants uses as a
+// join key; the 4-digit ticker is a display concern.
+type Filing struct {
+	DocID      string `json:"docId"`
+	EdinetCode string `json:"edinetCode"`
+	SecCode    string `json:"secCode"`
+	FilerName  string `json:"filerName"`
+
+	FiscalYearStart string `json:"fiscalYearStart"`
+	FiscalYearEnd   string `json:"fiscalYearEnd"`
+	// PeriodEnd is the end of the period being reported on. It equals
+	// FiscalYearEnd in an annual report but not in a semiannual one, so the two
+	// are kept apart: folded together, a mixed result set could not be joined
+	// against a financial time series without guessing.
+	PeriodEnd string `json:"periodEnd"`
+
+	DocumentType string `json:"documentType"`
+	// AccountingStandard is Japan GAAP, IFRS, or US GAAP. Element IDs differ
+	// across standards and this tool deliberately keeps no mapping table, so
+	// this is passed through for callers to branch on themselves.
+	AccountingStandard string `json:"accountingStandard"`
+}
+
+// Row is one reported value together with the filing it came from. The embedded
+// structs are flattened by encoding/json, so every output row carries its own
+// join keys.
+type Row struct {
+	Filing
+	Fact
+}
+
+// DEI element IDs identifying the filing itself.
+const (
+	deiEdinetCode         = "jpdei_cor:EDINETCodeDEI"
+	deiSecurityCode       = "jpdei_cor:SecurityCodeDEI"
+	deiFilerName          = "jpdei_cor:FilerNameInJapaneseDEI"
+	deiFiscalYearStart    = "jpdei_cor:CurrentFiscalYearStartDateDEI"
+	deiFiscalYearEnd      = "jpdei_cor:CurrentFiscalYearEndDateDEI"
+	deiPeriodEnd          = "jpdei_cor:CurrentPeriodEndDateDEI"
+	deiDocumentType       = "jpdei_cor:DocumentTypeDEI"
+	deiAccountingStandard = "jpdei_cor:AccountingStandardsDEI"
+)
+
+// DEI assembles the filing identity from a parsed bundle.
+//
+// Facts from the audit report are skipped: jpaud_* files carry their own DEI
+// block describing the auditor's document rather than the filing.
+func DEI(all []Fact) Filing {
+	var f Filing
+	into := map[string]*string{
+		deiEdinetCode:         &f.EdinetCode,
+		deiSecurityCode:       &f.SecCode,
+		deiFilerName:          &f.FilerName,
+		deiFiscalYearStart:    &f.FiscalYearStart,
+		deiFiscalYearEnd:      &f.FiscalYearEnd,
+		deiPeriodEnd:          &f.PeriodEnd,
+		deiDocumentType:       &f.DocumentType,
+		deiAccountingStandard: &f.AccountingStandard,
+	}
+
+	for _, fact := range all {
+		if fact.Value == "" || isAudit(fact.Source) {
+			continue
+		}
+		if p, ok := into[fact.ElementID]; ok && *p == "" {
+			*p = fact.Value
+		}
+	}
+
+	// Annual reports omit the period end because it is the fiscal year end.
+	if f.PeriodEnd == "" {
+		f.PeriodEnd = f.FiscalYearEnd
+	}
+	return f
+}
+
 // IsConsolidated reports whether this fact is a consolidated figure.
 func (f Fact) IsConsolidated() bool { return strings.HasPrefix(f.Consolidated, "連結") }
 

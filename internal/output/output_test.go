@@ -2,6 +2,8 @@ package output
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -46,18 +48,39 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
+func TestParseFormat(t *testing.T) {
+	for _, s := range []string{"table", "JSON", "csv"} {
+		if _, err := ParseFormat(s); err != nil {
+			t.Errorf("ParseFormat(%q): %v", s, err)
+		}
+	}
+	if _, err := ParseFormat("yaml"); err == nil {
+		t.Error("expected an error for an unsupported format")
+	}
+}
+
+type doc struct {
+	DocID  string `json:"docID"`
+	Filer  string `json:"filerName"`
+	DocTyp string `json:"docType"`
+}
+
+func docSpec() TableSpec[doc] {
+	return TableSpec[doc]{
+		Headers: []string{"DOCID", "FILER", "TYPE"},
+		Row:     func(d doc) []string { return []string{d.DocID, d.Filer, d.DocTyp} },
+	}
+}
+
 // Columns must line up when a cell contains CJK text, which is the normal case
 // for EDINET filer names.
 func TestTableAlignsCJKColumns(t *testing.T) {
 	var buf bytes.Buffer
-	tbl := Table{
-		Headers: []string{"DOCID", "FILER", "TYPE"},
-		Rows: [][]string{
-			{"S100AAAA", "トヨタ自動車株式会社", "有価証券報告書"},
-			{"S100BBBB", "Acme Inc.", "臨時報告書"},
-		},
+	recs := []doc{
+		{"S100AAAA", "トヨタ自動車株式会社", "有価証券報告書"},
+		{"S100BBBB", "Acme Inc.", "臨時報告書"},
 	}
-	if err := Render(&buf, FormatTable, tbl, nil); err != nil {
+	if err := Render(&buf, FormatTable, docSpec(), recs); err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 
@@ -66,7 +89,6 @@ func TestTableAlignsCJKColumns(t *testing.T) {
 		t.Fatalf("got %d lines, want 3:\n%s", len(lines), buf.String())
 	}
 
-	// The final column must start at the same cell on every line.
 	want := -1
 	for _, line := range lines {
 		idx := strings.LastIndex(line, "  ")
@@ -83,12 +105,11 @@ func TestTableAlignsCJKColumns(t *testing.T) {
 
 func TestTableTruncatesToMax(t *testing.T) {
 	var buf bytes.Buffer
-	tbl := Table{
-		Headers: []string{"A", "B"},
-		Rows:    [][]string{{"short", strings.Repeat("x", 100)}},
-		Max:     []int{0, 10},
-	}
-	if err := Render(&buf, FormatTable, tbl, nil); err != nil {
+	spec := docSpec()
+	spec.Max = []int{0, 10, 0}
+	recs := []doc{{"short", strings.Repeat("x", 100), "t"}}
+
+	if err := Render(&buf, FormatTable, spec, recs); err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	if strings.Contains(buf.String(), strings.Repeat("x", 11)) {
@@ -102,11 +123,8 @@ func TestTableTruncatesToMax(t *testing.T) {
 // Newlines inside a value would otherwise split one row across two lines.
 func TestTableSanitizesEmbeddedNewlines(t *testing.T) {
 	var buf bytes.Buffer
-	tbl := Table{
-		Headers: []string{"A", "B"},
-		Rows:    [][]string{{"x", "line1\nline2"}},
-	}
-	if err := Render(&buf, FormatTable, tbl, nil); err != nil {
+	recs := []doc{{"x", "line1\nline2", "t"}}
+	if err := Render(&buf, FormatTable, docSpec(), recs); err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	if got := strings.Count(strings.TrimRight(buf.String(), "\n"), "\n"); got != 1 {
@@ -114,15 +132,14 @@ func TestTableSanitizesEmbeddedNewlines(t *testing.T) {
 	}
 }
 
+// Max is a display concern; the machine-readable formats must never lose data.
 func TestCSVKeepsFullValues(t *testing.T) {
 	var buf bytes.Buffer
 	long := strings.Repeat("x", 100)
-	tbl := Table{
-		Headers: []string{"A", "B"},
-		Rows:    [][]string{{"x,y", long}},
-		Max:     []int{0, 10},
-	}
-	if err := Render(&buf, FormatCSV, tbl, nil); err != nil {
+	spec := docSpec()
+	spec.Max = []int{0, 10, 0}
+
+	if err := Render(&buf, FormatCSV, spec, []doc{{"x,y", long, "t"}}); err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	out := buf.String()
@@ -134,10 +151,39 @@ func TestCSVKeepsFullValues(t *testing.T) {
 	}
 }
 
-func TestJSONRendersRawValue(t *testing.T) {
+// The two machine-readable formats are both derived from the struct, so a field
+// can never appear in one and not the other.
+func TestCSVHeaderMatchesJSONKeys(t *testing.T) {
+	var csvBuf, jsonBuf bytes.Buffer
+	recs := []doc{{"S100AAAA", "トヨタ", "有価証券報告書"}}
+
+	if err := Render(&csvBuf, FormatCSV, docSpec(), recs); err != nil {
+		t.Fatalf("csv: %v", err)
+	}
+	if err := Render(&jsonBuf, FormatJSON, docSpec(), recs); err != nil {
+		t.Fatalf("json: %v", err)
+	}
+
+	header, _, _ := strings.Cut(csvBuf.String(), "\n")
+	var decoded []map[string]any
+	if err := json.Unmarshal(jsonBuf.Bytes(), &decoded); err != nil {
+		t.Fatalf("decoding JSON output: %v", err)
+	}
+
+	for _, col := range strings.Split(strings.TrimSpace(header), ",") {
+		if _, ok := decoded[0][col]; !ok {
+			t.Errorf("CSV column %q has no matching JSON key", col)
+		}
+	}
+	if len(decoded[0]) != len(strings.Split(strings.TrimSpace(header), ",")) {
+		t.Errorf("JSON has %d keys but CSV has %s", len(decoded[0]), header)
+	}
+}
+
+func TestJSONKeepsJapaneseReadable(t *testing.T) {
 	var buf bytes.Buffer
-	raw := []map[string]string{{"docID": "S100AAAA", "filerName": "トヨタ"}}
-	if err := Render(&buf, FormatJSON, Table{}, raw); err != nil {
+	recs := []doc{{"S100AAAA", "トヨタ", "有価証券報告書"}}
+	if err := Render(&buf, FormatJSON, docSpec(), recs); err != nil {
 		t.Fatalf("Render: %v", err)
 	}
 	out := buf.String()
@@ -150,13 +196,68 @@ func TestJSONRendersRawValue(t *testing.T) {
 	}
 }
 
-func TestParseFormat(t *testing.T) {
-	for _, s := range []string{"table", "JSON", "csv"} {
-		if _, err := ParseFormat(s); err != nil {
-			t.Errorf("ParseFormat(%q): %v", s, err)
-		}
+// A pipeline reading the output must not have to special-case "no results".
+func TestEmptyResultSets(t *testing.T) {
+	var jsonBuf, csvBuf bytes.Buffer
+
+	if err := Render(&jsonBuf, FormatJSON, docSpec(), nil); err != nil {
+		t.Fatalf("json: %v", err)
 	}
-	if _, err := ParseFormat("yaml"); err == nil {
-		t.Error("expected an error for an unsupported format")
+	if got := strings.TrimSpace(jsonBuf.String()); got != "[]" {
+		t.Errorf("empty JSON = %q, want []", got)
+	}
+
+	if err := Render(&csvBuf, FormatCSV, docSpec(), nil); err != nil {
+		t.Fatalf("csv: %v", err)
+	}
+	if got := strings.TrimSpace(csvBuf.String()); got != "docID,filerName,docType" {
+		t.Errorf("empty CSV = %q, want the header row", got)
+	}
+}
+
+// json and csv must not accumulate the whole result set, so a batch larger than
+// memory can still be written. Both wrap the writer in a bufio.Writer, so the
+// assertion is that output appears once that buffer fills — not on the very
+// first record.
+func TestStreamsWriteIncrementally(t *testing.T) {
+	for _, f := range []Format{FormatJSON, FormatCSV} {
+		t.Run(string(f), func(t *testing.T) {
+			var buf bytes.Buffer
+			s := NewStream(&buf, f, docSpec())
+			for i := range 2000 {
+				rec := doc{DocID: fmt.Sprintf("S%06d", i), Filer: "トヨタ自動車株式会社"}
+				if err := s.Write(rec); err != nil {
+					t.Fatalf("Write: %v", err)
+				}
+			}
+			if buf.Len() == 0 {
+				t.Errorf("%s buffered 2000 records instead of writing through", f)
+			}
+			if err := s.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if !strings.Contains(buf.String(), "S001999") {
+				t.Errorf("%s lost the last record", f)
+			}
+		})
+	}
+}
+
+// The table format is the one that legitimately buffers, because column widths
+// are not known until the last row.
+func TestTableBuffersUntilClose(t *testing.T) {
+	var buf bytes.Buffer
+	s := NewStream(&buf, FormatTable, docSpec())
+	if err := s.Write(doc{DocID: "S100AAAA"}); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("table wrote before Close: %q", buf.String())
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if !strings.Contains(buf.String(), "S100AAAA") {
+		t.Errorf("Close did not flush:\n%s", buf.String())
 	}
 }

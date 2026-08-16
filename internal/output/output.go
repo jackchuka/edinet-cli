@@ -2,10 +2,13 @@
 package output
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 )
 
@@ -38,69 +41,191 @@ func ParseFormat(s string) (Format, error) {
 	}
 }
 
-// Table is a rendered view of a result set.
+// TableSpec describes the human-readable view of a record type.
 //
 // Max caps a column's display width, in terminal cells; 0 means unlimited. It
 // applies only to the table format, where a 147-character document description
 // would otherwise destroy the layout. JSON and CSV always carry full values.
-type Table struct {
+type TableSpec[T any] struct {
 	Headers []string
-	Rows    [][]string
 	Max     []int
+	// Row renders one record as table cells. It is consulted for the table
+	// format only, because json and csv are derived from the record itself.
+	Row func(T) []string
 }
 
-// Render writes the result set in the requested format. raw is marshalled
-// directly for JSON, so the full API response survives the table's column
-// selection and truncation.
-func Render(w io.Writer, f Format, t Table, raw any) error {
+// Stream writes records one at a time.
+//
+// json and csv write through, so a batch of filings never has to fit in memory
+// at once. table buffers, because column widths cannot be known until the last
+// row has been seen; that is acceptable because the table format is for
+// interactive use, where result sets are small and --limit is available.
+type Stream[T any] interface {
+	Write(T) error
+	Close() error
+}
+
+// NewStream returns a Stream writing f to w.
+//
+// json and csv buffer through bufio rather than writing a syscall per record,
+// which matters once a batch runs to millions of rows. The buffer is fixed
+// size, so the memory guarantee still holds.
+func NewStream[T any](w io.Writer, f Format, spec TableSpec[T]) Stream[T] {
 	switch f {
 	case FormatJSON:
-		return renderJSON(w, raw)
+		return &jsonStream[T]{w: bufio.NewWriter(w)}
 	case FormatCSV:
-		return renderCSV(w, t)
+		return &csvStream[T]{w: csv.NewWriter(w)}
 	default:
-		return renderTable(w, t)
+		return &tableStream[T]{w: w, spec: spec}
 	}
 }
 
-func renderJSON(w io.Writer, raw any) error {
-	enc := json.NewEncoder(w)
-	enc.SetIndent("", "  ")
-	enc.SetEscapeHTML(false)
-	return enc.Encode(raw)
-}
-
-func renderCSV(w io.Writer, t Table) error {
-	cw := csv.NewWriter(w)
-	if len(t.Headers) > 0 {
-		if err := cw.Write(t.Headers); err != nil {
+// Render writes every record and closes the stream. It is the convenience form
+// for callers that already hold the whole result set.
+func Render[T any](w io.Writer, f Format, spec TableSpec[T], recs []T) error {
+	s := NewStream(w, f, spec)
+	for _, r := range recs {
+		if err := s.Write(r); err != nil {
 			return err
 		}
 	}
-	if err := cw.WriteAll(t.Rows); err != nil {
-		return err
-	}
-	cw.Flush()
-	return cw.Error()
+	return s.Close()
 }
 
-func renderTable(w io.Writer, t Table) error {
-	if len(t.Rows) == 0 && len(t.Headers) == 0 {
-		return nil
+type jsonStream[T any] struct {
+	w   *bufio.Writer
+	n   int
+	err error
+}
+
+func (s *jsonStream[T]) Write(rec T) error {
+	if s.err != nil {
+		return s.err
 	}
 
-	cols := len(t.Headers)
-	for _, r := range t.Rows {
+	sep := ",\n"
+	if s.n == 0 {
+		sep = "[\n"
+	}
+	if _, s.err = io.WriteString(s.w, sep); s.err != nil {
+		return s.err
+	}
+
+	b, err := marshalRecord(rec)
+	if err != nil {
+		s.err = err
+		return err
+	}
+	if _, s.err = s.w.Write(b); s.err != nil {
+		return s.err
+	}
+	s.n++
+	return nil
+}
+
+func (s *jsonStream[T]) Close() error {
+	if s.err != nil {
+		return s.err
+	}
+	// An empty result must still decode as an array, so pipelines do not have
+	// to special-case "no results".
+	closing := "\n]\n"
+	if s.n == 0 {
+		closing = "[]\n"
+	}
+	if _, err := io.WriteString(s.w, closing); err != nil {
+		return err
+	}
+	return s.w.Flush()
+}
+
+// marshalRecord renders one array element, indented to sit inside the array
+// framing the stream writes around it.
+func marshalRecord(v any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("  ", "  ")
+	if err := enc.Encode(v); err != nil {
+		return nil, err
+	}
+	return append([]byte("  "), bytes.TrimRight(buf.Bytes(), "\n")...), nil
+}
+
+type csvStream[T any] struct {
+	w      *csv.Writer
+	header bool
+	err    error
+}
+
+func (s *csvStream[T]) Write(rec T) error {
+	if s.err != nil {
+		return s.err
+	}
+	if s.err = s.writeHeader(); s.err != nil {
+		return s.err
+	}
+	s.err = s.w.Write(valuesOf(rec))
+	return s.err
+}
+
+func (s *csvStream[T]) writeHeader() error {
+	if s.header {
+		return nil
+	}
+	s.header = true
+	return s.w.Write(fieldsOf(reflect.TypeFor[T]()))
+}
+
+func (s *csvStream[T]) Close() error {
+	if s.err != nil {
+		return s.err
+	}
+	// Headers are written even with no rows, so the shape of the output does
+	// not depend on whether anything matched.
+	if err := s.writeHeader(); err != nil {
+		return err
+	}
+	s.w.Flush()
+	return s.w.Error()
+}
+
+type tableStream[T any] struct {
+	w    io.Writer
+	spec TableSpec[T]
+	rows [][]string
+}
+
+func (s *tableStream[T]) Write(rec T) error {
+	s.rows = append(s.rows, s.spec.Row(rec))
+	return nil
+}
+
+func (s *tableStream[T]) Close() error {
+	// A header with no rows under it is not a table, just noise above whatever
+	// message the caller prints about the empty result; docs list and company
+	// search never call Render at all in that case, so a streaming caller like
+	// facts must reach the same output by skipping the render here instead.
+	if len(s.rows) == 0 {
+		return nil
+	}
+	return renderTable(s.w, s.spec.Headers, s.rows, s.spec.Max)
+}
+
+func renderTable(w io.Writer, headers []string, rows [][]string, maxes []int) error {
+	cols := len(headers)
+	for _, r := range rows {
 		cols = max(cols, len(r))
 	}
 
 	// Clip first so column widths are measured against what is actually printed.
-	cells := make([][]string, 0, len(t.Rows)+1)
-	if len(t.Headers) > 0 {
-		cells = append(cells, clipRow(t.Headers, cols, t.Max))
+	cells := make([][]string, 0, len(rows)+1)
+	if len(headers) > 0 {
+		cells = append(cells, clipRow(headers, cols, maxes))
 	}
-	for _, r := range t.Rows {
-		cells = append(cells, clipRow(r, cols, t.Max))
+	for _, r := range rows {
+		cells = append(cells, clipRow(r, cols, maxes))
 	}
 
 	widths := make([]int, cols)
