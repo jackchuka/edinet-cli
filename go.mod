@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/spf13/cobra v1.10.2
-	golang.org/x/sync v0.22.0
+	golang.org/x/sync v0.23.0
 	golang.org/x/text v0.41.0
 )
 
