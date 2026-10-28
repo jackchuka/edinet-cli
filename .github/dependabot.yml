@@ -9,8 +9,6 @@ updates:
     commit-message:
       prefix: "deps"
       include: "scope"
-    reviewers:
-      - "jackchuka"
     labels:
       - "dependencies"
       - "go"
@@ -24,8 +22,6 @@ updates:
     commit-message:
       prefix: "ci"
       include: "scope"
-    reviewers:
-      - "jackchuka"
     assignees:
       - "jackchuka"
     labels:
